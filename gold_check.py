@@ -1,4 +1,5 @@
 """Gold Price Watcher - เวอร์ชัน GitHub Actions
+- ดึงราคาทอง (PAXG/USD) โดยไล่ลองทีละแหล่ง: Binance -> Coinbase -> Kraken
 - แจ้งเตือนเมื่อราคาขยับเกิน Threshold จากราคาฐาน
 - ปรับฐานราคาตามเวลา ทุก 00:00 / 06:00 / 12:00 / 18:00 (เวลาไทย)
   * รอบ 12:00 / 18:00 แท็ก @everyone
@@ -9,8 +10,13 @@ import json
 import requests
 from datetime import datetime, timezone, timedelta
 
+# ==================== CONFIGURATION ====================
+
 BINANCE_API_URL = "https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT"
+COINBASE_API_URL = "https://api.coinbase.com/v2/prices/PAXG-USD/spot"
+KRAKEN_API_URL = "https://api.kraken.com/0/public/Ticker?pair=PAXGUSD"
 EXCHANGE_RATE_API_URL = "https://open.er-api.com/v6/latest/USD"
+
 PRICE_THRESHOLD_USD = 5.0          # แจ้งเตือนเมื่อราคาขยับเกินกี่ USD
 THAI_GOLD_FACTOR = 0.4729
 STATE_FILE = "state.json"
@@ -25,15 +31,44 @@ QUIET_HOURS = [0, 6]
 # เวลาไทย (UTC+7)
 TZ_TH = timezone(timedelta(hours=7))
 
+# ========================================================
+
 
 def get_gold_price():
+    """ดึงราคาทอง (PAXG/USD) โดยไล่ลองทีละแหล่ง: Binance -> Coinbase -> Kraken"""
+    # 1) Binance
     try:
         r = requests.get(BINANCE_API_URL, timeout=10)
         r.raise_for_status()
-        return float(r.json()["price"])
+        price = float(r.json()["price"])
+        print(f"[OK] ได้ราคาจาก Binance: {price:,.2f} USD")
+        return price
     except Exception as e:
-        print(f"[ERROR] ดึงราคาทองไม่สำเร็จ: {e}")
-        return None
+        print(f"[WARN] Binance ใช้ไม่ได้ ({e}) ลองแหล่งถัดไป...")
+
+    # 2) Coinbase
+    try:
+        r = requests.get(COINBASE_API_URL, timeout=10)
+        r.raise_for_status()
+        price = float(r.json()["data"]["amount"])
+        print(f"[OK] ได้ราคาจาก Coinbase: {price:,.2f} USD")
+        return price
+    except Exception as e:
+        print(f"[WARN] Coinbase ใช้ไม่ได้ ({e}) ลองแหล่งถัดไป...")
+
+    # 3) Kraken
+    try:
+        r = requests.get(KRAKEN_API_URL, timeout=10)
+        r.raise_for_status()
+        result = r.json()["result"]
+        first_pair = next(iter(result))
+        price = float(result[first_pair]["c"][0])
+        print(f"[OK] ได้ราคาจาก Kraken: {price:,.2f} USD")
+        return price
+    except Exception as e:
+        print(f"[ERROR] ทุกแหล่งราคาใช้ไม่ได้ในรอบนี้: {e}")
+
+    return None
 
 
 def get_usd_thb_rate():
@@ -110,7 +145,7 @@ def send_alert(current, change, base):
         f"📌 **ราคาฐานก่อนหน้า:** `{base:,.2f} USD`\n"
         f"{build_thb_section(current)}"
         f"⏰ **เวลา (ไทย):** `{ts}`\n\n"
-        f"_ข้อมูลจาก Binance PAXGUSDT | รันบน GitHub Actions ☁️_"
+        f"_ข้อมูลจาก PAXG (Tokenized Gold 1:1) | รันบน GitHub Actions ☁️_"
     )
     post_discord(content)
 
@@ -120,6 +155,7 @@ def send_reset_notice(current, old_base, reset_hour):
     ts = datetime.now(TZ_TH).strftime("%Y-%m-%d %H:%M:%S")
     diff = current - old_base
     mention = "" if reset_hour in QUIET_HOURS else "@everyone\n"
+    next_hour = RESET_HOURS[(RESET_HOURS.index(reset_hour) + 1) % len(RESET_HOURS)]
 
     content = (
         f"{mention}"
@@ -129,8 +165,7 @@ def send_reset_notice(current, old_base, reset_hour):
         f"(ขยับ `{diff:+,.2f} USD` ในรอบที่ผ่านมา)\n"
         f"{build_thb_section(current)}"
         f"⏰ **เวลา (ไทย):** `{ts}`\n\n"
-        f"_ระบบทำงานปกติ ✅ | รอบถัดไป: "
-        f"{RESET_HOURS[(RESET_HOURS.index(reset_hour) + 1) % len(RESET_HOURS)]:02d}:00 น._"
+        f"_ระบบทำงานปกติ ✅ | รอบถัดไป: {next_hour:02d}:00 น._"
     )
     post_discord(content)
 
