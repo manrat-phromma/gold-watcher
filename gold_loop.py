@@ -17,7 +17,7 @@ HSH_API_URL = "https://apicheckprice.huasengheng.com/api/values/getprice/"
 PRICE_THRESHOLD_USD = 5.0
 THAI_GOLD_FACTOR = 0.4729
 CHECK_INTERVAL_SECONDS = 300
-HISTORY_DAYS = 7                    # เก็บประวัติราคากี่วัน
+HISTORY_DAYS = 7
 
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
@@ -30,7 +30,7 @@ QUIET_HOURS = [0, 6]
 TZ_TH = timezone(timedelta(hours=7))
 
 STATE = {"base_price": None, "last_reset": None, "sha": None}
-HISTORY = {"points": [], "sha": None}   # points = [[iso_time, price], ...]
+HISTORY = {"points": [], "sha": None}
 
 
 # ==================== WEB SERVER ====================
@@ -60,7 +60,6 @@ def gh_headers():
 
 
 def gh_load(path):
-    """คืนค่า (data, sha) หรือ (None, None)"""
     if not (GITHUB_TOKEN and GITHUB_REPO):
         return None, None
     try:
@@ -191,7 +190,7 @@ def build_thb_section(current):
     return "🇹🇭 _ดึงราคาฝั่งไทยไม่ได้ในรอบนี้_\n"
 
 
-# ==================== สถิติ (ข้อความชุดที่ 2) ====================
+# ==================== สถิติ ====================
 def prices_within(now_th, hours):
     cutoff = now_th - timedelta(hours=hours)
     return [p[1] for p in HISTORY["points"]
@@ -199,19 +198,20 @@ def prices_within(now_th, hours):
 
 
 def price_at_hours_ago(now_th, hours):
-    """หาราคาที่ใกล้เคียงจุดเวลา X ชม.ที่แล้วที่สุด"""
+    """คืนค่า (ราคา, เวลาจริงของจุดนั้น) หรือ (None, None)"""
     target = now_th - timedelta(hours=hours)
-    best, best_gap = None, None
+    best, best_time, best_gap = None, None, None
     for iso, price in HISTORY["points"]:
-        gap = abs((datetime.fromisoformat(iso) - target).total_seconds())
+        dt = datetime.fromisoformat(iso)
+        gap = abs((dt - target).total_seconds())
         if best_gap is None or gap < best_gap:
-            best, best_gap = price, gap
-    # ยอมรับได้ถ้าห่างจากเป้าไม่เกิน 45 นาที
-    return best if best_gap is not None and best_gap <= 2700 else None
+            best, best_time, best_gap = price, dt, gap
+    if best_gap is not None and best_gap <= 2700:
+        return best, best_time
+    return None, None
 
 
 def build_stats_message(current, now_th):
-    """สร้างข้อความสถิติ - คำนวณจากข้อมูลจริงล้วน ไม่มีการทำนาย"""
     pts = HISTORY["points"]
     if len(pts) < 3:
         return (f"📊 **บทวิเคราะห์เชิงสถิติ**\n"
@@ -220,7 +220,6 @@ def build_stats_message(current, now_th):
 
     lines = [f"📊 **บทวิเคราะห์เชิงสถิติ** _(คำนวณจากข้อมูลจริง {len(pts)} จุด)_\n"]
 
-    # กรอบราคา 24 ชม.
     d1 = prices_within(now_th, 24)
     if len(d1) >= 3:
         lo, hi, avg = min(d1), max(d1), sum(d1) / len(d1)
@@ -235,28 +234,27 @@ def build_stats_message(current, now_th):
             f"`{abs(current - avg):,.2f}`)\n"
         )
 
-    # กรอบ 7 วัน
     d7 = prices_within(now_th, 24 * 7)
     if len(d7) >= 10 and len(d7) > len(d1):
         lines.append(f"🗓️ **กรอบ 7 วัน:** `{min(d7):,.2f}` – `{max(d7):,.2f} USD`\n")
 
-    # ทิศทางย้อนหลัง
     dirs = []
     for label, h in [("1 ชม.", 1), ("6 ชม.", 6), ("24 ชม.", 24)]:
-        old = price_at_hours_ago(now_th, h)
+        old, old_time = price_at_hours_ago(now_th, h)
         if old:
             ch = current - old
             pct = ch / old * 100
             arrow = "🟢▲" if ch > 0 else "🔴▼" if ch < 0 else "⚪️="
-            dirs.append(f"　{arrow} **{label}:** `{ch:+,.2f} USD` (`{pct:+.2f}%`)")
+            dirs.append(
+                f"　{arrow} **{label}:** `{ch:+,.2f} USD` (`{pct:+.2f}%`)\n"
+                f"　　_เทียบกับ `{old:,.2f} USD` เมื่อ {old_time.strftime('%H:%M')} น._"
+            )
     if dirs:
         lines.append("🧭 **ทิศทางย้อนหลัง**\n" + "\n".join(dirs) + "\n")
 
-    # ความผันผวน
     h1 = prices_within(now_th, 1)
     if len(h1) >= 2 and len(d1) >= 6:
         range_1h = max(h1) - min(h1)
-        # ค่าเฉลี่ยช่วงกว้างรายชั่วโมงของ 24 ชม.
         hourly_ranges = []
         for i in range(24):
             seg = [p[1] for p in HISTORY["points"]
@@ -274,11 +272,10 @@ def build_stats_message(current, now_th):
                 f"⚡ **ความผันผวน 1 ชม.ล่าสุด:** ช่วงกว้าง `{range_1h:,.2f} USD` "
                 f"| เฉลี่ยรายชั่วโมง `{avg_range:,.2f}` → **{note}**\n")
 
-    # ส่วนต่างราคาไทย
     hsh = get_hsh_prices()
     if hsh:
         spread = hsh["HSH"]["sell"] - hsh["HSH"]["buy"]
-        line = (f"💰 **ส่วนต่างซื้อ-ขาย ฮั่วเซ่งเฮง:** `{spread:,.0f} THB`/บาททอง\n")
+        line = f"💰 **ส่วนต่างซื้อ-ขาย ฮั่วเซ่งเฮง:** `{spread:,.0f} THB`/บาททอง\n"
         if "REF" in hsh:
             gap_buy = hsh["HSH"]["buy"] - hsh["REF"]["buy"]
             line += (f"　เทียบสมาคมฯ: รับซื้อ{'สูงกว่า' if gap_buy >= 0 else 'ต่ำกว่า'} "
@@ -316,7 +313,7 @@ def send_alert(current, change, base, now_th):
         f"{build_thb_section(current)}"
         f"⏰ **เวลา (ไทย):** `{ts}`\n"
     )
-    time.sleep(1)   # เว้นจังหวะให้ข้อความเรียงถูกลำดับ
+    time.sleep(1)
     post_discord(build_stats_message(current, now_th))
 
 
@@ -389,7 +386,6 @@ def check_once():
         save_state()
         save_history()
     elif len(HISTORY["points"]) % 6 == 0:
-        # บันทึกประวัติทุกๆ ~30 นาที เพื่อไม่ให้เขียน GitHub ถี่เกินไป
         save_history()
 
 
