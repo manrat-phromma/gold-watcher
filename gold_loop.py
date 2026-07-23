@@ -23,7 +23,7 @@ KRAKEN_OHLC_URL = "https://api.kraken.com/0/public/OHLC?pair=PAXGUSD&interval=5"
 EXCHANGE_RATE_API_URL = "https://open.er-api.com/v6/latest/USD"
 HSH_API_URL = "https://apicheckprice.huasengheng.com/api/values/getprice/"
 
-PRICE_THRESHOLD_USD = 5.0
+PRICE_THRESHOLD_USD = 10.0
 THAI_GOLD_FACTOR = 0.4729
 CHECK_INTERVAL_SECONDS = 300
 HISTORY_DAYS = 7
