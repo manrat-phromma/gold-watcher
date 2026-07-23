@@ -1,4 +1,4 @@
-"""Gold Price Watcher - Render Loop + สถิติ + กราฟ 24 ชม."""
+"""Gold Price Watcher - Render Loop + สถิติ + กราฟ + สรุปสถานการณ์"""
 import os
 import io
 import time
@@ -42,7 +42,7 @@ TZ_TH = timezone(timedelta(hours=7))
 
 STATE = {"base_price": None, "last_reset": None, "sha": None}
 HISTORY = {"points": [], "sha": None}
-EVENTS = {"items": [], "sha": None}   # [iso_time, price, kind]  kind: up/down/reset
+EVENTS = {"items": [], "sha": None}
 
 
 # ==================== WEB SERVER ====================
@@ -176,7 +176,6 @@ def get_gold_price():
 
 
 def get_klines_24h():
-    """ดึงแท่งเทียน 5 นาที ย้อนหลัง 24 ชม. -> [(เวลาไทย, ราคาปิด), ...]"""
     try:
         r = requests.get(BINANCE_KLINES_URL, timeout=15)
         r.raise_for_status()
@@ -254,7 +253,6 @@ def build_thb_section(current):
 
 # ==================== วาดกราฟ ====================
 def _draw_chart(times, prices, current, now_th, title, show_events_from):
-    """วาดกราฟ 1 ใบ -> bytes PNG"""
     if len(times) < 5:
         return None
     try:
@@ -328,7 +326,6 @@ def _draw_chart(times, prices, current, now_th, title, show_events_from):
 
 
 def make_charts(current, now_th):
-    """คืนค่า (กราฟ 24 ชม., กราฟซูม 6 ชม.ของวันนี้)"""
     candles = get_klines_24h()
     if len(candles) < 10:
         return None, None
@@ -341,7 +338,6 @@ def make_charts(current, now_th):
         f"Gold (PAXG/USD) 24h  |  {now_th.strftime('%d %b %Y %H:%M')} TH",
         now_th - timedelta(hours=24))
 
-    # ช่วง 6 ชม.ของวันปัจจุบัน: 00-06 / 06-12 / 12-18 / 18-24
     block = (now_th.hour // 6) * 6
     start = now_th.replace(hour=block, minute=0, second=0, microsecond=0)
     end = start + timedelta(hours=6)
@@ -360,8 +356,9 @@ def make_charts(current, now_th):
             f"{now_th.strftime('%d %b %Y')} TH",
             start)
         if chart6:
-            print(f"[OK] กราฟซูมช่วง {block:02d}:00-{block+6:02d}:00")
+            print(f"[OK] กราฟซูมช่วง {block:02d}:00")
     return chart24, chart6
+
 
 # ==================== สถิติ ====================
 def prices_within(now_th, hours):
@@ -459,6 +456,98 @@ def build_stats_message(current, now_th):
     return "".join(lines)
 
 
+# ==================== สรุปสถานการณ์ ====================
+def build_summary_message(current, now_th):
+    """สรุปเป็นภาษาคน - อิงเกณฑ์ตัวเลขล้วน ไม่มีการทำนาย"""
+    d1 = prices_within(now_th, 24)
+    if len(d1) < 6:
+        return None
+
+    lo, hi = min(d1), max(d1)
+    avg = sum(d1) / len(d1)
+    rng = hi - lo
+    parts = []
+
+    old6, t6 = price_at_hours_ago(now_th, 6)
+    if old6:
+        ch6 = current - old6
+        if abs(ch6) < 3:
+            parts.append(f"ช่วง 6 ชั่วโมงที่ผ่านมาราคาแทบไม่ขยับ "
+                         f"(`{ch6:+,.2f} USD` จาก {t6.strftime('%H:%M')} น.)")
+        else:
+            word = "ปรับขึ้น" if ch6 > 0 else "ปรับลง"
+            parts.append(f"ช่วง 6 ชั่วโมงที่ผ่านมาราคา{word} `{abs(ch6):,.2f} USD` "
+                         f"(จาก `{old6:,.2f}` เมื่อ {t6.strftime('%H:%M')} น.)")
+
+    if rng > 0:
+        pos = (current - lo) / rng * 100
+        if pos >= 85:
+            parts.append(f"ขณะนี้อยู่**ใกล้จุดสูงสุดของกรอบ 24 ชม.** "
+                         f"(สูงสุด `{hi:,.2f}`)")
+        elif pos <= 15:
+            parts.append(f"ขณะนี้อยู่**ใกล้จุดต่ำสุดของกรอบ 24 ชม.** "
+                         f"(ต่ำสุด `{lo:,.2f}`)")
+        else:
+            parts.append(f"ขณะนี้อยู่กลางกรอบ 24 ชม. (`{lo:,.2f}`–`{hi:,.2f}`)")
+
+    gap_avg = current - avg
+    if abs(gap_avg) >= 1:
+        side = "เหนือ" if gap_avg > 0 else "ใต้"
+        parts.append(f"ราคาอยู่{side}ค่าเฉลี่ย 24 ชม. `{abs(gap_avg):,.2f} USD`")
+
+    recent = [p[1] for p in HISTORY["points"]
+              if datetime.fromisoformat(p[0]) >= now_th - timedelta(hours=6)]
+    if len(recent) >= 6:
+        r_lo, r_hi = min(recent), max(recent)
+        from_low = current - r_lo
+        from_high = r_hi - current
+        if from_low >= 8 and from_low > from_high:
+            parts.append(f"เด้งขึ้นจากจุดต่ำสุดใน 6 ชม. (`{r_lo:,.2f}`) "
+                         f"แล้ว `{from_low:,.2f} USD`")
+        elif from_high >= 8 and from_high > from_low:
+            parts.append(f"ย่อลงจากจุดสูงสุดใน 6 ชม. (`{r_hi:,.2f}`) "
+                         f"แล้ว `{from_high:,.2f} USD`")
+
+    h1 = prices_within(now_th, 1)
+    if len(h1) >= 3:
+        range_1h = max(h1) - min(h1)
+        hourly = []
+        for i in range(24):
+            seg = [p[1] for p in HISTORY["points"]
+                   if now_th - timedelta(hours=i + 1) <=
+                   datetime.fromisoformat(p[0]) < now_th - timedelta(hours=i)]
+            if len(seg) >= 2:
+                hourly.append(max(seg) - min(seg))
+        if hourly:
+            avg_r = sum(hourly) / len(hourly)
+            if avg_r > 0:
+                ratio = range_1h / avg_r
+                if ratio >= 2:
+                    parts.append("ชั่วโมงล่าสุด**ผันผวนแรงกว่าปกติมาก** "
+                                 "(กว้างกว่าค่าเฉลี่ยรายชั่วโมงกว่า 2 เท่า)")
+                elif ratio >= 1.3:
+                    parts.append("ชั่วโมงล่าสุดผันผวนสูงกว่าปกติ")
+                elif ratio <= 0.5:
+                    parts.append("ชั่วโมงล่าสุดค่อนข้างนิ่ง ผันผวนต่ำกว่าปกติ")
+
+    ev6 = [e for e in EVENTS["items"]
+           if datetime.fromisoformat(e[0]) >= now_th - timedelta(hours=6)
+           and e[2] in ("up", "down")]
+    if len(ev6) >= 6:
+        ups = sum(1 for e in ev6 if e[2] == "up")
+        downs = len(ev6) - ups
+        parts.append(f"ระบบแจ้งเตือน **{len(ev6)} ครั้งใน 6 ชม.** "
+                     f"(ขึ้น {ups} / ลง {downs}) ถือว่าถี่กว่าปกติ")
+
+    if not parts:
+        return None
+
+    body = "\n".join(f"• {p}" for p in parts)
+    return (f"🧾 **สรุปสถานการณ์**\n{body}\n\n"
+            f"_สรุปจากตัวเลขที่บันทึกไว้จริงเท่านั้น "
+            f"ไม่ได้บอกทิศทางราคาในอนาคต และไม่ใช่คำแนะนำการลงทุน_")
+
+
 # ==================== DISCORD ====================
 def post_discord(content, image_bytes=None):
     if not DISCORD_WEBHOOK_URL:
@@ -479,6 +568,19 @@ def post_discord(content, image_bytes=None):
         print(f"[ERROR] ส่ง Discord ไม่สำเร็จ: {e}")
 
 
+def send_followups(current, now_th):
+    """ส่งสถิติ + กราฟ + สรุปสถานการณ์"""
+    c24, c6 = make_charts(current, now_th)
+    post_discord(build_stats_message(current, now_th), c24)
+    if c6:
+        time.sleep(1)
+        post_discord("🔍 **ซูมช่วง 6 ชั่วโมงของวันนี้**", c6)
+    summary = build_summary_message(current, now_th)
+    if summary:
+        time.sleep(1)
+        post_discord(summary)
+
+
 def send_alert(current, change, base, now_th):
     emoji = "🚀📈" if change > 0 else "🔻📉"
     ts = now_th.strftime("%Y-%m-%d %H:%M:%S")
@@ -492,11 +594,7 @@ def send_alert(current, change, base, now_th):
         f"⏰ **เวลา (ไทย):** `{ts}`\n"
     )
     time.sleep(1)
-    c24, c6 = make_charts(current, now_th)
-    post_discord(build_stats_message(current, now_th), c24)
-    if c6:
-        time.sleep(1)
-        post_discord("🔍 **ซูมช่วง 6 ชั่วโมงของวันนี้**", c6)
+    send_followups(current, now_th)
 
 
 def send_reset_notice(current, old_base, hour, now_th):
@@ -513,11 +611,7 @@ def send_reset_notice(current, old_base, hour, now_th):
         f"_ระบบทำงานปกติ ✅ | รอบถัดไป: {nxt:02d}:00 น._"
     )
     time.sleep(1)
-    c24, c6 = make_charts(current, now_th)
-    post_discord(build_stats_message(current, now_th), c24)
-    if c6:
-        time.sleep(1)
-        post_discord("🔍 **ซูมช่วง 6 ชั่วโมงของวันนี้**", c6)
+    send_followups(current, now_th)
 
 
 # ==================== LOGIC ====================
@@ -580,7 +674,7 @@ def check_once():
 
 if __name__ == "__main__":
     threading.Thread(target=start_web_server, daemon=True).start()
-    print("🚀 Gold Watcher (Loop + Stats + Chart) เริ่มทำงาน")
+    print("🚀 Gold Watcher (Loop + Stats + Chart + Summary) เริ่มทำงาน")
     load_all()
     while True:
         try:
