@@ -1,16 +1,24 @@
-"""Gold Price Watcher - Render Loop + สถิติ (2 ข้อความต่อกัน)"""
+"""Gold Price Watcher - Render Loop + สถิติ + กราฟ 24 ชม."""
 import os
+import io
 import time
 import json
 import base64
 import threading
 import requests
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 BINANCE_API_URL = "https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT"
+BINANCE_KLINES_URL = ("https://api.binance.com/api/v3/klines"
+                      "?symbol=PAXGUSDT&interval=5m&limit=288")
 COINBASE_API_URL = "https://api.coinbase.com/v2/prices/PAXG-USD/spot"
 KRAKEN_API_URL = "https://api.kraken.com/0/public/Ticker?pair=PAXGUSD"
+KRAKEN_OHLC_URL = "https://api.kraken.com/0/public/OHLC?pair=PAXGUSD&interval=5"
 EXCHANGE_RATE_API_URL = "https://open.er-api.com/v6/latest/USD"
 HSH_API_URL = "https://apicheckprice.huasengheng.com/api/values/getprice/"
 
@@ -18,12 +26,14 @@ PRICE_THRESHOLD_USD = 5.0
 THAI_GOLD_FACTOR = 0.4729
 CHECK_INTERVAL_SECONDS = 300
 HISTORY_DAYS = 7
+EVENT_KEEP_DAYS = 3
 
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
 STATE_PATH = "state.json"
 HISTORY_PATH = "history.json"
+EVENTS_PATH = "events.json"
 
 RESET_HOURS = [0, 6, 12, 18]
 QUIET_HOURS = [0, 6]
@@ -31,6 +41,7 @@ TZ_TH = timezone(timedelta(hours=7))
 
 STATE = {"base_price": None, "last_reset": None, "sha": None}
 HISTORY = {"points": [], "sha": None}
+EVENTS = {"items": [], "sha": None}   # [iso_time, price, kind]  kind: up/down/reset
 
 
 # ==================== WEB SERVER ====================
@@ -41,7 +52,8 @@ class StatusHandler(BaseHTTPRequestHandler):
         self.end_headers()
         now = datetime.now(TZ_TH).strftime("%Y-%m-%d %H:%M:%S")
         msg = (f"Gold Watcher OK\nBase: {STATE.get('base_price')}\n"
-               f"History points: {len(HISTORY['points'])}\nTime(TH): {now}\n")
+               f"History points: {len(HISTORY['points'])}\n"
+               f"Events: {len(EVENTS['items'])}\nTime(TH): {now}\n")
         self.wfile.write(msg.encode("utf-8"))
 
     def log_message(self, *args):
@@ -106,6 +118,11 @@ def load_all():
         HISTORY["points"] = hist.get("points", [])
         HISTORY["sha"] = hsha
         print(f"[OK] โหลดประวัติ {len(HISTORY['points'])} จุด")
+    ev, esha = gh_load(EVENTS_PATH)
+    if ev:
+        EVENTS["items"] = ev.get("items", [])
+        EVENTS["sha"] = esha
+        print(f"[OK] โหลดเหตุการณ์ {len(EVENTS['items'])} รายการ")
 
 
 def save_state():
@@ -118,6 +135,18 @@ def save_state():
 def save_history():
     HISTORY["sha"] = gh_save(HISTORY_PATH, {"points": HISTORY["points"]},
                              HISTORY["sha"], "update price history")
+
+
+def save_events():
+    EVENTS["sha"] = gh_save(EVENTS_PATH, {"items": EVENTS["items"]},
+                            EVENTS["sha"], "update events")
+
+
+def add_event(now_th, price, kind):
+    EVENTS["items"].append([now_th.isoformat(), round(price, 2), kind])
+    cutoff = now_th - timedelta(days=EVENT_KEEP_DAYS)
+    EVENTS["items"] = [e for e in EVENTS["items"]
+                       if datetime.fromisoformat(e[0]) >= cutoff]
 
 
 def add_history_point(price, now_th):
@@ -143,6 +172,38 @@ def get_gold_price():
             continue
     print("[ERROR] ดึงราคาไม่ได้เลย")
     return None
+
+
+def get_klines_24h():
+    """ดึงแท่งเทียน 5 นาที ย้อนหลัง 24 ชม. -> [(เวลาไทย, ราคาปิด), ...]"""
+    try:
+        r = requests.get(BINANCE_KLINES_URL, timeout=15)
+        r.raise_for_status()
+        out = []
+        for k in r.json():
+            t = datetime.fromtimestamp(k[0] / 1000, tz=timezone.utc).astimezone(TZ_TH)
+            out.append((t, float(k[4])))
+        if out:
+            print(f"[OK] ดึงแท่งเทียนจาก Binance {len(out)} แท่ง")
+            return out
+    except Exception as e:
+        print(f"[WARN] Binance klines ไม่ได้ ({e}) ลอง Kraken...")
+
+    try:
+        r = requests.get(KRAKEN_OHLC_URL, timeout=15)
+        r.raise_for_status()
+        result = r.json()["result"]
+        key = next(k for k in result if k != "last")
+        out = []
+        for k in result[key][-288:]:
+            t = datetime.fromtimestamp(int(k[0]), tz=timezone.utc).astimezone(TZ_TH)
+            out.append((t, float(k[4])))
+        if out:
+            print(f"[OK] ดึงแท่งเทียนจาก Kraken {len(out)} แท่ง")
+            return out
+    except Exception as e:
+        print(f"[WARN] Kraken OHLC ไม่ได้: {e}")
+    return []
 
 
 def get_hsh_prices():
@@ -190,6 +251,97 @@ def build_thb_section(current):
     return "🇹🇭 _ดึงราคาฝั่งไทยไม่ได้ในรอบนี้_\n"
 
 
+# ==================== วาดกราฟ ====================
+def make_chart(current, now_th):
+    """วาดกราฟ 24 ชม. พร้อมมาร์กจุดแจ้งเตือน/ปรับฐาน/โซนเฉลี่ย -> bytes PNG"""
+    candles = get_klines_24h()
+    if len(candles) < 10:
+        return None
+    try:
+        times = [c[0] for c in candles]
+        prices = [c[1] for c in candles]
+
+        avg = sum(prices) / len(prices)
+        var = sum((p - avg) ** 2 for p in prices) / len(prices)
+        sd = var ** 0.5
+
+        fig, ax = plt.subplots(figsize=(11, 5.5), dpi=110)
+        fig.patch.set_facecolor("#2b2d31")
+        ax.set_facecolor("#1e1f22")
+
+        # โซนราคาเฉลี่ย (เฉลี่ย ± 1 SD)
+        ax.axhspan(avg - sd, avg + sd, color="#5865f2", alpha=0.13,
+                   label=f"โซนปกติ {avg-sd:,.0f}–{avg+sd:,.0f}")
+        ax.axhline(avg, color="#5865f2", ls="--", lw=1.2, alpha=0.85,
+                   label=f"เฉลี่ย 24h {avg:,.2f}")
+
+        # เส้นราคา
+        ax.plot(times, prices, color="#f0b232", lw=1.7, label="PAXG/USD (5m)")
+
+        # ราคาฐาน + กรอบ threshold
+        base = STATE.get("base_price")
+        if base:
+            ax.axhline(base, color="#43b581", lw=1.4, alpha=0.9,
+                       label=f"ราคาฐาน {base:,.2f}")
+            ax.axhspan(base - PRICE_THRESHOLD_USD, base + PRICE_THRESHOLD_USD,
+                       color="#43b581", alpha=0.08)
+
+        # มาร์กเหตุการณ์
+        cutoff = now_th - timedelta(hours=24)
+        seen = set()
+        for iso, ep, kind in EVENTS["items"]:
+            et = datetime.fromisoformat(iso)
+            if et < cutoff:
+                continue
+            style = {
+                "up":    ("^", "#43b581", "แจ้งเตือน (ขึ้น)"),
+                "down":  ("v", "#ed4245", "แจ้งเตือน (ลง)"),
+                "reset": ("o", "#faa61a", "ปรับฐานตามเวลา"),
+            }.get(kind)
+            if not style:
+                continue
+            marker, color, lbl = style
+            ax.scatter([et], [ep], marker=marker, s=95, color=color,
+                       edgecolors="white", linewidths=0.7, zorder=5,
+                       label=lbl if lbl not in seen else None)
+            seen.add(lbl)
+            if kind == "reset":
+                ax.axvline(et, color="#faa61a", ls=":", lw=0.9, alpha=0.5)
+
+        # จุดราคาปัจจุบัน
+        ax.scatter([now_th], [current], marker="*", s=260, color="#ffffff",
+                   edgecolors="#f0b232", linewidths=1.4, zorder=6,
+                   label=f"ตอนนี้ {current:,.2f}")
+
+        ax.set_title(f"Gold (PAXG/USD) 24h  |  {now_th.strftime('%d %b %Y %H:%M')} TH",
+                     color="white", fontsize=13, pad=12)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=TZ_TH))
+        ax.xaxis.set_major_locator(mdates.HourLocator(interval=3))
+        ax.tick_params(colors="#b5bac1", labelsize=9)
+        for s in ax.spines.values():
+            s.set_color("#3f4147")
+        ax.grid(color="#3f4147", ls="--", lw=0.5, alpha=0.6)
+        ax.set_ylabel("USD / oz", color="#b5bac1", fontsize=10)
+        leg = ax.legend(loc="upper left", fontsize=8, framealpha=0.85,
+                        facecolor="#2b2d31", edgecolor="#3f4147", ncol=2)
+        for t in leg.get_texts():
+            t.set_color("#dbdee1")
+
+        buf = io.BytesIO()
+        fig.tight_layout()
+        fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
+        plt.close(fig)
+        buf.seek(0)
+        return buf.read()
+    except Exception as e:
+        print(f"[WARN] วาดกราฟไม่สำเร็จ: {e}")
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+        return None
+
+
 # ==================== สถิติ ====================
 def prices_within(now_th, hours):
     cutoff = now_th - timedelta(hours=hours)
@@ -198,7 +350,6 @@ def prices_within(now_th, hours):
 
 
 def price_at_hours_ago(now_th, hours):
-    """คืนค่า (ราคา, เวลาจริงของจุดนั้น) หรือ (None, None)"""
     target = now_th - timedelta(hours=hours)
     best, best_time, best_gap = None, None, None
     for iso, price in HISTORY["points"]:
@@ -288,13 +439,19 @@ def build_stats_message(current, now_th):
 
 
 # ==================== DISCORD ====================
-def post_discord(content):
+def post_discord(content, image_bytes=None):
     if not DISCORD_WEBHOOK_URL:
         return
     try:
-        r = requests.post(DISCORD_WEBHOOK_URL,
-                          json={"content": content,
-                                "username": "Gold Price Watcher 🥇"}, timeout=10)
+        if image_bytes:
+            files = {"file": ("gold_chart.png", image_bytes, "image/png")}
+            data = {"payload_json": json.dumps(
+                {"content": content, "username": "Gold Price Watcher 🥇"})}
+            r = requests.post(DISCORD_WEBHOOK_URL, data=data, files=files, timeout=25)
+        else:
+            r = requests.post(DISCORD_WEBHOOK_URL,
+                              json={"content": content,
+                                    "username": "Gold Price Watcher 🥇"}, timeout=10)
         r.raise_for_status()
         print("[OK] ส่ง Discord สำเร็จ")
     except Exception as e:
@@ -314,7 +471,7 @@ def send_alert(current, change, base, now_th):
         f"⏰ **เวลา (ไทย):** `{ts}`\n"
     )
     time.sleep(1)
-    post_discord(build_stats_message(current, now_th))
+    post_discord(build_stats_message(current, now_th), make_chart(current, now_th))
 
 
 def send_reset_notice(current, old_base, hour, now_th):
@@ -331,7 +488,7 @@ def send_reset_notice(current, old_base, hour, now_th):
         f"_ระบบทำงานปกติ ✅ | รอบถัดไป: {nxt:02d}:00 น._"
     )
     time.sleep(1)
-    post_discord(build_stats_message(current, now_th))
+    post_discord(build_stats_message(current, now_th), make_chart(current, now_th))
 
 
 # ==================== LOGIC ====================
@@ -374,9 +531,11 @@ def check_once():
 
     triggered = False
     if abs(diff) >= PRICE_THRESHOLD_USD:
+        add_event(now_th, current, "up" if diff > 0 else "down")
         send_alert(current, diff, base, now_th)
         triggered = True
     elif need_reset:
+        add_event(now_th, current, "reset")
         send_reset_notice(current, base, boundary.hour, now_th)
         triggered = True
 
@@ -385,13 +544,14 @@ def check_once():
         STATE["last_reset"] = boundary
         save_state()
         save_history()
+        save_events()
     elif len(HISTORY["points"]) % 6 == 0:
         save_history()
 
 
 if __name__ == "__main__":
     threading.Thread(target=start_web_server, daemon=True).start()
-    print("🚀 Gold Watcher (Render Loop + Stats) เริ่มทำงาน")
+    print("🚀 Gold Watcher (Loop + Stats + Chart) เริ่มทำงาน")
     load_all()
     while True:
         try:
