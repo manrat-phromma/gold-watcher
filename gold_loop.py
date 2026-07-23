@@ -10,6 +10,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+matplotlib.rcParams["axes.unicode_minus"] = False
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -252,77 +253,61 @@ def build_thb_section(current):
 
 
 # ==================== วาดกราฟ ====================
-def make_chart(current, now_th):
-    """วาดกราฟ 24 ชม. พร้อมมาร์กจุดแจ้งเตือน/ปรับฐาน/โซนเฉลี่ย -> bytes PNG"""
-    candles = get_klines_24h()
-    if len(candles) < 10:
+def _draw_chart(times, prices, current, now_th, title, show_events_from):
+    """วาดกราฟ 1 ใบ -> bytes PNG"""
+    if len(times) < 5:
         return None
     try:
-        times = [c[0] for c in candles]
-        prices = [c[1] for c in candles]
-
         avg = sum(prices) / len(prices)
-        var = sum((p - avg) ** 2 for p in prices) / len(prices)
-        sd = var ** 0.5
+        sd = (sum((p - avg) ** 2 for p in prices) / len(prices)) ** 0.5
 
         fig, ax = plt.subplots(figsize=(11, 5.5), dpi=110)
         fig.patch.set_facecolor("#2b2d31")
         ax.set_facecolor("#1e1f22")
 
-        # โซนราคาเฉลี่ย (เฉลี่ย ± 1 SD)
         ax.axhspan(avg - sd, avg + sd, color="#5865f2", alpha=0.13,
-                   label=f"โซนปกติ {avg-sd:,.0f}–{avg+sd:,.0f}")
+                   label=f"Normal zone {avg-sd:,.0f}-{avg+sd:,.0f}")
         ax.axhline(avg, color="#5865f2", ls="--", lw=1.2, alpha=0.85,
-                   label=f"เฉลี่ย 24h {avg:,.2f}")
+                   label=f"Average {avg:,.2f}")
+        ax.plot(times, prices, color="#f0b232", lw=1.9, label="PAXG/USD (5m)")
 
-        # เส้นราคา
-        ax.plot(times, prices, color="#f0b232", lw=1.7, label="PAXG/USD (5m)")
-
-        # ราคาฐาน + กรอบ threshold
         base = STATE.get("base_price")
         if base:
-            ax.axhline(base, color="#43b581", lw=1.4, alpha=0.9,
-                       label=f"ราคาฐาน {base:,.2f}")
+            ax.axhline(base, color="#43b581", lw=1.5, alpha=0.9,
+                       label=f"Base {base:,.2f}")
             ax.axhspan(base - PRICE_THRESHOLD_USD, base + PRICE_THRESHOLD_USD,
                        color="#43b581", alpha=0.08)
 
-        # มาร์กเหตุการณ์
-        cutoff = now_th - timedelta(hours=24)
         seen = set()
         for iso, ep, kind in EVENTS["items"]:
             et = datetime.fromisoformat(iso)
-            if et < cutoff:
+            if et < show_events_from or et > now_th:
                 continue
-            style = {
-                "up":    ("^", "#43b581", "แจ้งเตือน (ขึ้น)"),
-                "down":  ("v", "#ed4245", "แจ้งเตือน (ลง)"),
-                "reset": ("o", "#faa61a", "ปรับฐานตามเวลา"),
-            }.get(kind)
+            style = {"up": ("^", "#43b581", "Alert UP"),
+                     "down": ("v", "#ed4245", "Alert DOWN"),
+                     "reset": ("o", "#faa61a", "Time reset")}.get(kind)
             if not style:
                 continue
             marker, color, lbl = style
-            ax.scatter([et], [ep], marker=marker, s=95, color=color,
-                       edgecolors="white", linewidths=0.7, zorder=5,
+            ax.scatter([et], [ep], marker=marker, s=110, color=color,
+                       edgecolors="white", linewidths=0.8, zorder=5,
                        label=lbl if lbl not in seen else None)
             seen.add(lbl)
             if kind == "reset":
-                ax.axvline(et, color="#faa61a", ls=":", lw=0.9, alpha=0.5)
+                ax.axvline(et, color="#faa61a", ls=":", lw=1.0, alpha=0.55)
 
-        # จุดราคาปัจจุบัน
-        ax.scatter([now_th], [current], marker="*", s=260, color="#ffffff",
-                   edgecolors="#f0b232", linewidths=1.4, zorder=6,
-                   label=f"ตอนนี้ {current:,.2f}")
+        ax.scatter([now_th], [current], marker="*", s=300, color="#ffffff",
+                   edgecolors="#f0b232", linewidths=1.5, zorder=6,
+                   label=f"Now {current:,.2f}")
 
-        ax.set_title(f"Gold (PAXG/USD) 24h  |  {now_th.strftime('%d %b %Y %H:%M')} TH",
-                     color="white", fontsize=13, pad=12)
+        ax.set_title(title, color="white", fontsize=13, pad=12)
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=TZ_TH))
-        ax.xaxis.set_major_locator(mdates.HourLocator(interval=3))
-        ax.tick_params(colors="#b5bac1", labelsize=9)
+        ax.tick_params(colors="#b5bac1", labelsize=10)
         for s in ax.spines.values():
             s.set_color("#3f4147")
         ax.grid(color="#3f4147", ls="--", lw=0.5, alpha=0.6)
         ax.set_ylabel("USD / oz", color="#b5bac1", fontsize=10)
-        leg = ax.legend(loc="upper left", fontsize=8, framealpha=0.85,
+        leg = ax.legend(loc="best", fontsize=8.5, framealpha=0.9,
                         facecolor="#2b2d31", edgecolor="#3f4147", ncol=2)
         for t in leg.get_texts():
             t.set_color("#dbdee1")
@@ -341,6 +326,42 @@ def make_chart(current, now_th):
             pass
         return None
 
+
+def make_charts(current, now_th):
+    """คืนค่า (กราฟ 24 ชม., กราฟซูม 6 ชม.ของวันนี้)"""
+    candles = get_klines_24h()
+    if len(candles) < 10:
+        return None, None
+
+    times = [c[0] for c in candles]
+    prices = [c[1] for c in candles]
+
+    chart24 = _draw_chart(
+        times, prices, current, now_th,
+        f"Gold (PAXG/USD) 24h  |  {now_th.strftime('%d %b %Y %H:%M')} TH",
+        now_th - timedelta(hours=24))
+
+    # ช่วง 6 ชม.ของวันปัจจุบัน: 00-06 / 06-12 / 12-18 / 18-24
+    block = (now_th.hour // 6) * 6
+    start = now_th.replace(hour=block, minute=0, second=0, microsecond=0)
+    end = start + timedelta(hours=6)
+
+    zt, zp = [], []
+    for t, p in zip(times, prices):
+        if start <= t <= end:
+            zt.append(t)
+            zp.append(p)
+
+    chart6 = None
+    if len(zt) >= 5:
+        chart6 = _draw_chart(
+            zt, zp, current, now_th,
+            f"Gold Zoom {block:02d}:00-{(block+6) % 24:02d}:00  |  "
+            f"{now_th.strftime('%d %b %Y')} TH",
+            start)
+        if chart6:
+            print(f"[OK] กราฟซูมช่วง {block:02d}:00-{block+6:02d}:00")
+    return chart24, chart6
 
 # ==================== สถิติ ====================
 def prices_within(now_th, hours):
@@ -471,7 +492,11 @@ def send_alert(current, change, base, now_th):
         f"⏰ **เวลา (ไทย):** `{ts}`\n"
     )
     time.sleep(1)
-    post_discord(build_stats_message(current, now_th), make_chart(current, now_th))
+    c24, c6 = make_charts(current, now_th)
+    post_discord(build_stats_message(current, now_th), c24)
+    if c6:
+        time.sleep(1)
+        post_discord("🔍 **ซูมช่วง 6 ชั่วโมงของวันนี้**", c6)
 
 
 def send_reset_notice(current, old_base, hour, now_th):
@@ -488,7 +513,11 @@ def send_reset_notice(current, old_base, hour, now_th):
         f"_ระบบทำงานปกติ ✅ | รอบถัดไป: {nxt:02d}:00 น._"
     )
     time.sleep(1)
-    post_discord(build_stats_message(current, now_th), make_chart(current, now_th))
+    c24, c6 = make_charts(current, now_th)
+    post_discord(build_stats_message(current, now_th), c24)
+    if c6:
+        time.sleep(1)
+        post_discord("🔍 **ซูมช่วง 6 ชั่วโมงของวันนี้**", c6)
 
 
 # ==================== LOGIC ====================
