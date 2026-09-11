@@ -26,7 +26,7 @@ HSH_API_URL = "https://apicheckprice.huasengheng.com/api/values/getprice/"
 PRICE_THRESHOLD_USD = 10.0
 THAI_GOLD_FACTOR = 0.4729
 CHECK_INTERVAL_SECONDS = 300
-HISTORY_DAYS = 7
+HISTORY_DAYS = 30
 EVENT_KEEP_DAYS = 3
 
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
